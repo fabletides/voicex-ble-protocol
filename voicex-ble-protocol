@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""
+VoiceX BLE Communication Module (bluezero version)
+Рабочая реализация BLE Peripheral (сервер) для связи с мобильным приложением
+"""
+
+import json
+import logging
+import threading
+import time
+from bluezero import peripheral
+from .protocols import VoiceXProtocol, DeviceStatus, VoiceXState
+
+logger = logging.getLogger(__name__)
+
+class BLECommunicator(VoiceXProtocol):
+    """BLE коммуникатор для VoiceX через bluezero (Peripheral mode)"""
+
+    # UUIDs (должны совпадать с клиентским приложением)
+    VOICEX_SERVICE_UUID = '12345678-1234-1234-1234-123456789abc'
+    STATUS_CHAR_UUID = '12345678-1234-1234-1234-123456789ab1'
+    COMMAND_CHAR_UUID = '12345678-1234-1234-1234-123456789ab2'
+    CONFIG_CHAR_UUID = '12345678-1234-1234-1234-123456789ab3'
+
+    def __init__(self, voicex_engine):
+        super().__init__(voicex_engine)
+        self.peripheral = None
+        self.running = False
+
+        self.status_notify_func = None
+        logger.info("🔵 BLECommunicator (bluezero) initialized")
+
+    def _read_status(self):
+        self._update_system_metrics()
+        state_json = json.dumps(self.state.to_dict()).encode('utf-8')
+        logger.debug(f"📱 Read status: {state_json}")
+        return state_json
+
+    def _write_command(self, value):
+        try:
+            command_str = value.decode('utf-8')
+            command = json.loads(command_str)
+            logger.info(f"📱 Command received: {command}")
+            # Обработка в отдельном потоке
+            threading.Thread(target=lambda: asyncio.run(self._process_command(command)), daemon=True).start()
+        except Exception as e:
+            logger.error(f"❌ Command write error: {e}")
+
+    def _read_config(self):
+        config = self._get_current_config()
+        return json.dumps(config).encode('utf-8')
+
+    def _write_config(self, value):
+        try:
+            config = json.loads(value.decode('utf-8'))
+            threading.Thread(target=lambda: asyncio.run(self._apply_config(config)), daemon=True).start()
+        except Exception as e:
+            logger.error(f"❌ Config write error: {e}")
+
+    async def start_server(self):
+        """Запуск BLE Peripheral сервера"""
+        logger.info("🔵 Starting BLE server via bluezero...")
+
+        status_char = peripheral.Characteristic(
+            uuid=self.STATUS_CHAR_UUID,
+            properties=['read', 'notify'],
+            secure=['read'],
+            read_callback=self._read_status
+        )
+
+        command_char = peripheral.Characteristic(
+            uuid=self.COMMAND_CHAR_UUID,
+            properties=['write'],
+            secure=['write'],
+            write_callback=self._write_command
+        )
+
+        config_char = peripheral.Characteristic(
+            uuid=self.CONFIG_CHAR_UUID,
+            properties=['read', 'write'],
+            secure=['read', 'write'],
+            read_callback=self._read_config,
+            write_callback=self._write_config
+        )
+
+        voicex_service = peripheral.Service(
+            uuid=self.VOICEX_SERVICE_UUID,
+            characteristics=[status_char, command_char, config_char]
+        )
+
+        self.peripheral = peripheral.Peripheral(
+            adapter_addr=self._get_adapter_address(),
+            local_name='VoiceX',
+            services=[voicex_service]
+        )
+
+        self.running = True
+        threading.Thread(target=self.peripheral.run, daemon=True).start()
+        logger.info("✅ BLE Peripheral server started")
+
+    async def stop_server(self):
+        """Остановка BLE сервера"""
+        if self.peripheral:
+            self.running = False
+            self.peripheral.quit()
+            logger.info("🔵 BLE server stopped")
+
+    def _get_adapter_address(self):
+        # TODO: заменить на адрес твоего Bluetooth-адаптера
+        # Можно получить с помощью команды: hcitool dev
+        return 'XX:XX:XX:XX:XX:XX'
+
+    def get_connection_info(self):
+        return {
+            'protocol': 'BLE',
+            'service_uuid': self.VOICEX_SERVICE_UUID,
+            'server_running': self.running
+        }
+
+
+
+
+          #!/usr/bin/env python3
+"""
+VoiceX Communication Protocols
+Общие протоколы и базовые классы для связи
+"""
+
+import logging
+import time
+import threading
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, asdict
+from enum import Enum
+from typing import Dict, List, Callable, Any, Optional
+
+logger = logging.getLogger(__name__)
+
+class DeviceStatus(Enum):
+    """Статусы устройства VoiceX"""
+    IDLE = "idle"
+    READY = "ready"
+    PROCESSING = "processing"
+    CALIBRATING = "calibrating"
+    ERROR = "error"
+    UPDATING = "updating"
+
+@dataclass
+class VoiceXState:
+    """Состояние устройства VoiceX"""
+    status: DeviceStatus = DeviceStatus.IDLE
+    volume: int = 50  # 0-100
+    signal_level: float = 0.0  # 0.0-1.0
+    battery_level: int = 100  # 0-100
+    cpu_usage: float = 0.0  # 0.0-100.0
+    memory_usage: float = 0.0  # 0.0-100.0
+    processing_mode: str = "normal"  # normal, quiet, loud, accessibility
+    analog_soul_enabled: bool = True
+    voicefixer_enabled: bool = True
+    spatial_audio_enabled: bool = True
+    is_wearing: bool = False
+    sos_triggered: bool = False
+    uptime_seconds: int = 0
+    
+    def to_dict(self) -> Dict:
+        """Конвертация в словарь для JSON"""
+        result = asdict(self)
+        result['status'] = self.status.value
+        return result
+
+class VoiceXProtocol(ABC):
+    """Базовый класс для всех протоколов связи"""
+    
+    def __init__(self, voicex_engine):
+        self.voicex_engine = voicex_engine
+        self.state = VoiceXState()
+        self.status_callbacks: List[Callable] = []
+        
+        # Время запуска для uptime
+        self.start_time = time.time()
+    
+    @abstractmethod
+    async def start_server(self):
+        """Запуск сервера/службы"""
+        pass
+    
+    @abstractmethod
+    async def stop_server(self):
+        """Остановка сервера/службы"""
+        pass
+    
+    async def _process_command(self, command: Dict):
+        """Обработка команд (общая логика)"""
+        cmd_type = command.get('type')
+        
+        if cmd_type == 'set_volume':
+            volume = max(0, min(100, command.get('volume', 50)))
+            self.state.volume = volume
+            # Применяем к DSP процессору
+            if hasattr(self.voicex_engine, 'dsp_processor'):
+                self.voicex_engine.dsp_processor.set_volume(volume / 100.0)
+            
+            logger.info(f"🔊 Volume set to {volume}%")
+                
+        elif cmd_type == 'set_mode':
+            mode = command.get('mode', 'normal')
+            if mode in ['normal', 'quiet', 'loud', 'accessibility']:
+                self.state.processing_mode = mode
+                await self._apply_processing_mode(mode)
+                
+        elif cmd_type == 'toggle_feature':
+            feature = command.get('feature')
+            enabled = command.get('enabled', True)
+            
+            if feature == 'analog_soul':
+                self.state.analog_soul_enabled = enabled
+                logger.info(f"🧠 Analog Soul: {'enabled' if enabled else 'disabled'}")
+            elif feature == 'voicefixer':
+                self.state.voicefixer_enabled = enabled
+                logger.info(f"🎯 VoiceFixer: {'enabled' if enabled else 'disabled'}")
+            elif feature == 'spatial_audio':
+                self.state.spatial_audio_enabled = enabled
+                logger.info(f"🔊 Spatial Audio: {'enabled' if enabled else 'disabled'}")
+                
+        elif cmd_type == 'start_calibration':
+            self.state.status = DeviceStatus.CALIBRATING
+            # Запуск калибровки в отдельном потоке
+            threading.Thread(target=self._run_calibration, daemon=True).start()
+            
+        elif cmd_type == 'emergency_stop':
+            self.state.sos_triggered = True
+            await self._handle_sos()
+            
+        elif cmd_type == 'ping':
+            # Простой ping для проверки связи
+            logger.debug("📡 Ping received")
+            
+        elif cmd_type == 'get_diagnostics':
+            return await self._get_diagnostics()
+            
+        else:
+            logger.warning(f"⚠️ Unknown command type: {cmd_type}")
+    
+    async def _apply_processing_mode(self, mode: str):
+        """Применение режима обработки"""
+        mode_configs = {
+            'normal': {'agc_target': 0.3, 'enhancement_strength': 1.0},
+            'quiet': {'agc_target': 0.5, 'enhancement_strength': 1.3},
+            'loud': {'agc_target': 0.2, 'enhancement_strength': 0.8},
+            'accessibility': {'agc_target': 0.6, 'enhancement_strength': 1.5}
+        }
+        
+        config = mode_configs.get(mode, mode_configs['normal'])
+        
+        # Применяем настройки к DSP
+        if hasattr(self.voicex_engine, 'dsp_processor'):
+            self.voicex_engine.dsp_processor.agc_target_rms = config['agc_target']
+        
+        logger.info(f"🎛️ Applied processing mode: {mode}")
+    
+    def _get_current_config(self) -> Dict:
+        """Получение текущей конфигурации"""
+        return {
+            'volume': self.state.volume,
+            'processing_mode': self.state.processing_mode,
+            'features': {
+                'analog_soul': self.state.analog_soul_enabled,
+                'voicefixer': self.state.voicefixer_enabled,
+                'spatial_audio': self.state.spatial_audio_enabled
+            },
+            'device_info': {
+                'uptime_seconds': int(time.time() - self.start_time),
+                'status': self.state.status.value
+            }
+        }
+    
+    async def _apply_config(self, config: Dict):
+        """Применение новой конфигурации"""
+        if 'volume' in config:
+            await self._process_command({'type': 'set_volume', 'volume': config['volume']})
+        
+        if 'processing_mode' in config:
+            await self._process_command({'type': 'set_mode', 'mode': config['processing_mode']})
+        
+        # Обработка features
+        features = config.get('features', {})
+        for feature_name, enabled in features.items():
+            await self._process_command({
+                'type': 'toggle_feature',
+                'feature': feature_name,
+                'enabled': enabled
+            })
+    
+    def _run_calibration(self):
+        """Запуск калибровки в отдельном потоке"""
+        try:
+            logger.info("🎯 Starting calibration...")
+            
+            # Здесь будет интеграция с VoiceXCalibrator
+            # from voicex_main import VoiceXCalibrator
+            # calibrator = VoiceXCalibrator(self.voicex_engine)
+            # calibrator.run_calibration(duration_seconds=30)
+            
+            # Симуляция калибровки
+            time.sleep(30)
+            
+            self.state.status = DeviceStatus.READY
+            logger.info("✅ Calibration completed")
+            
+        except Exception as e:
+            logger.error(f"❌ Calibration error: {e}")
+            self.state.status = DeviceStatus.ERROR
+    
+    async def _handle_sos(self):
+        """Обработка SOS сигнала"""
+        logger.warning("🚨 SOS signal triggered!")
+        
+        # Воспроизводим SOS звук
+        if hasattr(self.voicex_engine, 'play_sos_sound'):
+            self.voicex_engine.play_sos_sound()
+        
+        # Сбрасываем флаг через 5 секунд
+        def reset_sos():
+            time.sleep(5)
+            self.state.sos_triggered = False
+        
+        threading.Thread(target=reset_sos, daemon=True).start()
+    
+    def _update_system_metrics(self):
+        """Обновление системных метрик"""
+        try:
+            import psutil
+            
+            self.state.cpu_usage = psutil.cpu_percent()
+            self.state.memory_usage = psutil.virtual_memory().percent
+            self.state.uptime_seconds = int(time.time() - self.start_time)
+            
+            # Обновляем уровень сигнала из аудио движка
+            if hasattr(self.voicex_engine, 'get_signal_level'):
+                self.state.signal_level = self.voicex_engine.get_signal_level()
+            
+            # Обновляем статус
+            if hasattr(self.voicex_engine, 'is_running') and self.voicex_engine.is_running:
+                if self.state.status == DeviceStatus.IDLE:
+                    self.state.status = DeviceStatus.READY
+            else:
+                if self.state.status == DeviceStatus.READY:
+                    self.state.status = DeviceStatus.IDLE
+                
+        except Exception as e:
+            logger.error(f"❌ Metrics update error: {e}")
+    
+    async def _get_diagnostics(self) -> Dict:
+        """Получение диагностической информации"""
+        try:
+            import psutil
+            
+            diagnostics = {
+                'system': {
+                    'cpu_count': psutil.cpu_count(),
+                    'memory_total': psutil.virtual_memory().total,
+                    'disk_usage': psutil.disk_usage('/').percent,
+                    'boot_time': psutil.boot_time()
+                },
+                'voicex': {
+                    'engine_running': hasattr(self.voicex_engine, 'is_running') and self.voicex_engine.is_running,
+                    'audio_latency': getattr(self.voicex_engine, 'audio_latency', 0),
+                    'processing_latency': getattr(self.voicex_engine, 'processing_latency', 0)
+                },
+                'audio': {
+                    'sample_rate': getattr(self.voicex_engine, 'sample_rate', 48000),
+                    'chunk_size': getattr(self.voicex_engine, 'chunk_size', 2048),
+                    'input_channels': 1,
+                    'output_channels': 2
+                }
+            }
+            
+            return diagnostics
+            
+        except Exception as e:
+            logger.error(f"❌ Diagnostics error: {e}")
+            return {'error': str(e)}
+    
+    def add_status_callback(self, callback: Callable):
+        """Добавление callback для изменений статуса"""
+        self.status_callbacks.append(callback)
+    
+    def notify_status_change(self, event_type: str, data: Any):
+        """Уведомление о изменении статуса"""
+        for callback in self.status_callbacks:
+            try:
+                callback(event_type, data)
+            except Exception as e:
+                logger.error(f"Status callback error: {e}")
+
+class CommandValidator:
+    """Валидатор команд для безопасности"""
+    
+    ALLOWED_COMMANDS = [
+        'set_volume', 'set_mode', 'toggle_feature', 
+        'start_calibration', 'emergency_stop', 'ping', 'get_diagnostics'
+    ]
+    
+    ALLOWED_MODES = ['normal', 'quiet', 'loud', 'accessibility']
+    
+    ALLOWED_FEATURES = ['analog_soul', 'voicefixer', 'spatial_audio']
+    
+    @classmethod
+    def validate_command(cls, command: Dict) -> tuple[bool, str]:
+        """Валидация команды"""
+        
+        if not isinstance(command, dict):
+            return False, "Command must be a dictionary"
+        
+        cmd_type = command.get('type')
+        if not cmd_type:
+            return False, "Command type is required"
+        
+        if cmd_type not in cls.ALLOWED_COMMANDS:
+            return False, f"Unknown command type: {cmd_type}"
+        
+        # Специфичные валидации
+        if cmd_type == 'set_volume':
+            volume = command.get('volume')
+            if not isinstance(volume, (int, float)) or not (0 <= volume <= 100):
+                return False, "Volume must be between 0 and 100"
+        
+        elif cmd_type == 'set_mode':
+            mode = command.get('mode')
+            if mode not in cls.ALLOWED_MODES:
+                return False, f"Invalid mode: {mode}"
+        
+        elif cmd_type == 'toggle_feature':
+            feature = command.get('feature')
+            if feature not in cls.ALLOWED_FEATURES:
+                return False, f"Invalid feature: {feature}"
+            
+            enabled = command.get('enabled')
+            if not isinstance(enabled, bool):
+                return False, "Feature enabled must be boolean"
+        
+        return True, "Command is valid"
+
+class SecurityManager:
+    """Менеджер безопасности для коммуникации"""
+    
+    def __init__(self):
+        self.failed_attempts = {}
+        self.max_attempts = 5
+        self.lockout_duration = 300  # 5 минут
+    
+    def check_rate_limit(self, client_id: str) -> bool:
+        """Проверка rate limiting"""
+        current_time = time.time()
+        
+        if client_id in self.failed_attempts:
+            attempts, last_attempt = self.failed_attempts[client_id]
+            
+            if attempts >= self.max_attempts:
+                if current_time - last_attempt < self.lockout_duration:
+                    return False  # Заблокирован
+                else:
+                    # Сброс счетчика после lockout
+                    del self.failed_attempts[client_id]
+        
+        return True
+    
+    def record_failed_attempt(self, client_id: str):
+        """Запись неудачной попытки"""
+        current_time = time.time()
+        
+        if client_id in self.failed_attempts:
+            attempts, _ = self.failed_attempts[client_id]
+            self.failed_attempts[client_id] = (attempts + 1, current_time)
+        else:
+            self.failed_attempts[client_id] = (1, current_time)
+    
+    def record_successful_attempt(self, client_id: str):
+        """Запись успешной попытки"""
+        if client_id in self.failed_attempts:
+            del self.failed_attempts[client_id]
